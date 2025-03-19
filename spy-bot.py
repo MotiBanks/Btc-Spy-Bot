@@ -66,6 +66,8 @@ else:
         # Add more addresses as needed
     ])
 
+
+
 # Known exchange deposit addresses to monitor
 EXCHANGES = {
     # Binance deposit addresses
@@ -84,21 +86,21 @@ MIXERS = {
     "bc1q5shngj9335rentd6uqlvllf9p33xd4w7s4y046": "ChipMixer",
 }
 
-# Store transaction history to prevent duplicate alerts
 def load_transaction_history():
     if os.path.exists(TRANSACTION_HISTORY_FILE):
         try:
             with open(TRANSACTION_HISTORY_FILE, "r") as f:
-                return set(json.load(f))
+                return json.load(f)
         except:
-            return set()
-    return set()
+            return {"transactions": []}
+    return {"transactions": []}
 
-def save_transaction_history(transactions):
+def save_transaction_history(tx_history):
     with open(TRANSACTION_HISTORY_FILE, "w") as f:
-        json.dump(list(transactions), f)
+        json.dump(tx_history, f)
 
-alerted_transactions = load_transaction_history()
+# Initialize with empty history
+tx_history = load_transaction_history()
 
 def save_wallets():
     """Save the updated wallet list to a file."""
@@ -358,7 +360,7 @@ def should_track_address(address, inputs=None, outputs=None):
         for output in outputs or []:
             if output.get("address") == address:
                 value_btc = output.get("value", 0) / 100000000
-                if value_btc > 0.01:  # Only track if it received more than 0.01 BTC
+                if value_btc > 0.1:  # Only track if it received more than 0.1 BTC
                     return True
         
     return False
@@ -377,6 +379,18 @@ def process_new_wallet(address, depth=0, max_depth=2):
     try:
         # Get transactions for this wallet
         transactions = loop.run_until_complete(get_transactions(address))
+        
+        global tx_history
+        for tx in transactions[:10]:  
+            tx_hash = tx.get("txid", tx.get("hash", ""))
+            if not any(item["tx_id"] == tx_hash for item in tx_history["transactions"]):
+                tx_history["transactions"].append({
+                    "tx_id": tx_hash,
+                    "timestamp": int(time.time())
+                })
+
+        # Save transaction history
+        save_transaction_history(tx_history)
         
         for tx in transactions[:10]:  # Process up to 10 recent transactions
             tx_hash = tx.get("txid", tx.get("hash", ""))
@@ -437,9 +451,73 @@ def process_new_wallet(address, depth=0, max_depth=2):
     finally:
         loop.close()
 
+async def cleanup_inactive_wallets():
+    """Remove wallets that haven't had activity in the last 30 days."""
+    current_time = int(time.time())
+    inactive_threshold = current_time - (30 * 24 * 60 * 60)  # 30 days
+    
+    wallets_to_remove = set()
+    for wallet in list(WALLETS):  # Create a copy to iterate over
+        try:
+            # Check last transaction time
+            transactions = await get_transactions(wallet, limit=1)
+            if not transactions:
+                # Keep wallets with balance even if no transactions
+                balance = await get_balance(wallet)
+                if balance and balance > 0.1:  # Keep wallets with meaningful balance
+                    continue
+                wallets_to_remove.add(wallet)
+                continue
+                
+            tx = transactions[0]
+            tx_time = tx.get("time", tx.get("confirmed", tx.get("received_time", 0)))
+            if tx_time and tx_time < inactive_threshold:
+                # Check if still has balance
+                balance = await get_balance(wallet)
+                if not balance or balance < 0.1:  # Remove if inactive and small/no balance
+                    wallets_to_remove.add(wallet)
+        except Exception as e:
+            logger.error(f"Error checking activity for {wallet}: {e}")
+    
+    # Remove inactive wallets
+    for wallet in wallets_to_remove:
+        WALLETS.remove(wallet)
+        logger.info(f"Removed inactive wallet: {wallet}")
+    
+    if wallets_to_remove:
+        save_wallets()
+        logger.info(f"Removed {len(wallets_to_remove)} inactive wallets")
+
+async def get_latest_block_height():
+    """Get the latest block height."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{BTC_APIS['blockstream']}/blocks/tip/height", ssl=ssl_context) as response:
+                return int(await response.text())
+    except:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{BTC_APIS['mempool']}/blocks/tip/height", ssl=ssl_context) as response:
+                    return int(await response.text())
+        except:
+            return 0
+
 async def track_wallets():
     """Main function to track transactions on monitored wallets."""
+    cleanup_counter = 0  # Counter to trigger cleanup periodically
+    
     while True:
+        current_time = int(time.time())
+        
+        # Increment counter
+        cleanup_counter += 1
+        
+        # Run cleanup every 24 hours (12 cycles if you check every 2 minutes)
+        if cleanup_counter >= 720:  # 24 hours * 60 minutes / 2 minutes per cycle
+            logger.info("Running cleanup of inactive wallets...")
+            await cleanup_inactive_wallets()
+            cleanup_counter = 0
+        
         for wallet in WALLETS:
             try:
                 transactions = await get_transactions(wallet)
@@ -448,9 +526,26 @@ async def track_wallets():
                     tx_hash = tx.get("txid", tx.get("hash", ""))
                     
                     # Skip if already alerted
-                    if tx_hash in alerted_transactions:
+                    if any(item["tx_id"] == tx_hash for item in tx_history["transactions"]):
                         continue
                     
+                    # Get transaction details
+                    tx_details = await get_transaction_details(tx_hash)
+                    if not tx_details:
+                        continue
+                    
+                    # Check if transaction is recent (within last 10 minutes)
+                    tx_time = tx_details.get("time", tx_details.get("confirmed", tx_details.get("received_time", 0)))
+                    
+                    # If we can't get a timestamp, use a block height check as fallback
+                    if not tx_time and "block_height" in tx_details:
+                        # Skip if not in the latest block
+                        latest_block = await get_latest_block_height()
+                        if latest_block - tx_details["block_height"] > 1:
+                            continue
+                    elif tx_time and (current_time - tx_time) > 600:  # Older than 10 minutes
+                        continue
+
                     # Get transaction details and extract important information
                     tx_details = await get_transaction_details(tx_hash)
                     if not tx_details:
@@ -537,9 +632,12 @@ async def track_wallets():
                     
                     logger.info(f"Alert sent for transaction {tx_hash}")
                     
-                    # Add transaction to alerted set to prevent duplicates
-                    alerted_transactions.add(tx_hash)
-                    save_transaction_history(alerted_transactions)
+                    # When alerting, store with timestamp
+                    tx_history["transactions"].append({
+                        "tx_id": tx_hash,
+                        "timestamp": current_time
+                    })
+                    save_transaction_history(tx_history)
                     
                     # Auto-track new addresses
                     for out_addr in output_addresses:
@@ -558,7 +656,7 @@ async def track_wallets():
                 logger.error(f"Error processing wallet {wallet}: {e}")
                 
         # Save status after each full cycle
-        save_transaction_history(alerted_transactions)
+        save_transaction_history(tx_history)
                 
         # Check again after delay
         await asyncio.sleep(120)  # Check every 2 minutes
@@ -761,6 +859,27 @@ async def main():
     logger.info("Starting Bitcoin Tracker Bot")
     print("Starting Bitcoin Tracker Bot")
     
+    # Check initial wallet balances
+    if WALLETS:
+        active_wallets = set()
+        logger.info("Checking balances of initial wallets...")
+        
+        for wallet in WALLETS:
+            try:
+                balance = await get_balance(wallet)  # Note: using await instead of loop.run_until_complete
+                if balance and balance > 0:
+                    active_wallets.add(wallet)
+                    logger.info(f"Wallet {wallet} has balance: {balance:.8f} BTC - will be tracked")
+                else:
+                    logger.info(f"Wallet {wallet} has zero balance - skipping")
+            except Exception as e:
+                logger.error(f"Error checking balance for {wallet}: {e}")
+        
+        global WALLETS
+        WALLETS = active_wallets
+        save_wallets()
+        logger.info(f"Filtered down to {len(WALLETS)} wallets with non-zero balances")
+    
     # Start Telegram bot polling in a separate thread
     telegram_thread = threading.Thread(target=start_bot_polling, daemon=True)
     telegram_thread.start()
@@ -808,7 +927,7 @@ async def main():
 # Handle graceful shutdown
 def signal_handler(sig, frame):
     logger.info("Shutting down Bitcoin Tracker Bot...")
-    save_transaction_history(alerted_transactions)
+    save_transaction_history(tx_history)
     save_wallets()
     sys.exit(0)
 
