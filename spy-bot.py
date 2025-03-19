@@ -66,8 +66,6 @@ else:
         # Add more addresses as needed
     ])
 
-
-
 # Known exchange deposit addresses to monitor
 EXCHANGES = {
     # Binance deposit addresses
@@ -859,6 +857,9 @@ async def main():
     logger.info("Starting Bitcoin Tracker Bot")
     print("Starting Bitcoin Tracker Bot")
     
+    # Declare WALLETS as global first
+    global WALLETS
+    
     # Check initial wallet balances
     if WALLETS:
         active_wallets = set()
@@ -875,7 +876,7 @@ async def main():
             except Exception as e:
                 logger.error(f"Error checking balance for {wallet}: {e}")
         
-        global WALLETS
+        
         WALLETS = active_wallets
         save_wallets()
         logger.info(f"Filtered down to {len(WALLETS)} wallets with non-zero balances")
