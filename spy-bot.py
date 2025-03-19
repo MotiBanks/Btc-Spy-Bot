@@ -859,16 +859,17 @@ async def main():
     logger.info("Starting Bitcoin Tracker Bot")
     print("Starting Bitcoin Tracker Bot")
     
+    # Declare WALLETS as global first
+    global WALLETS
+    
     # Check initial wallet balances
     if WALLETS:
         active_wallets = set()
         logger.info("Checking balances of initial wallets...")
         
-        global WALLETS
-        
         for wallet in WALLETS:
             try:
-                balance = await get_balance(wallet)  # Note: using await instead of loop.run_until_complete
+                balance = await get_balance(wallet)
                 if balance and balance > 0:
                     active_wallets.add(wallet)
                     logger.info(f"Wallet {wallet} has balance: {balance:.8f} BTC - will be tracked")
@@ -877,7 +878,7 @@ async def main():
             except Exception as e:
                 logger.error(f"Error checking balance for {wallet}: {e}")
         
-       
+        # Now you can modify WALLETS
         WALLETS = active_wallets
         save_wallets()
         logger.info(f"Filtered down to {len(WALLETS)} wallets with non-zero balances")
