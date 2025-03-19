@@ -25,37 +25,15 @@ BLOCKCYPHER_API_KEY = os.getenv("BLOCKCYPHER_API_KEY")  # Optional but recommend
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
     raise ValueError("Missing required environment variables. Ensure .env is properly configured.")
 
+# File paths
+WALLET_FILE = "tracked_btc_wallets.txt"
+TRANSACTION_HISTORY_FILE = "btc_transaction_history.json"
+
 # Initialize Telegram bot
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Thread-safe wallet management
 WALLETS_LOCK = threading.Lock()
-WALLETS = set()
-
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("bitcoin_tracker.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# File to store dynamically tracked wallets
-WALLET_FILE = "tracked_btc_wallets.txt"
-TRANSACTION_HISTORY_FILE = "btc_transaction_history.json"
-
-# BTC API endpoints (using multiple for redundancy)
-BTC_APIS = {
-    "blockstream": "https://blockstream.info/api",
-    "blockcypher": "https://api.blockcypher.com/v1/btc/main",
-    "mempool": "https://mempool.space/api"
-}
-
-# Create SSL context for secure connections
-ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 # Load wallets from file or initialize a default set
 if os.path.exists(WALLET_FILE):
@@ -69,6 +47,27 @@ else:
         "3LCGsSmfr24demGvriN4e3ft8wEcDuHFqh",          # Linked to exchange hacks
         # Add more addresses as needed
     ])
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bitcoin_tracker.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# BTC API endpoints (using multiple for redundancy)
+BTC_APIS = {
+    "blockstream": "https://blockstream.info/api",
+    "blockcypher": "https://api.blockcypher.com/v1/btc/main",
+    "mempool": "https://mempool.space/api"
+}
+
+# Create SSL context for secure connections
+ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 # Known exchange deposit addresses to monitor
 EXCHANGES = {
