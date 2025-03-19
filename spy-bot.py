@@ -864,6 +864,8 @@ async def main():
         active_wallets = set()
         logger.info("Checking balances of initial wallets...")
         
+        global WALLETS
+        
         for wallet in WALLETS:
             try:
                 balance = await get_balance(wallet)  # Note: using await instead of loop.run_until_complete
@@ -875,7 +877,7 @@ async def main():
             except Exception as e:
                 logger.error(f"Error checking balance for {wallet}: {e}")
         
-        global WALLETS
+       
         WALLETS = active_wallets
         save_wallets()
         logger.info(f"Filtered down to {len(WALLETS)} wallets with non-zero balances")
