@@ -28,6 +28,10 @@ if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
 # Initialize Telegram bot
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
+# Thread-safe wallet management
+WALLETS_LOCK = threading.Lock()
+WALLETS = set()
+
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
@@ -102,9 +106,10 @@ tx_history = load_transaction_history()
 
 def save_wallets():
     """Save the updated wallet list to a file."""
-    with open(WALLET_FILE, "w") as f:
-        for wallet in WALLETS:
-            f.write(wallet + "\n")
+    with WALLETS_LOCK:
+        with open(WALLET_FILE, "w") as f:
+            for wallet in WALLETS:
+                f.write(wallet + "\n")
 
 def add_wallet(address):
     """Add a new wallet to track."""
@@ -113,26 +118,28 @@ def add_wallet(address):
            (address.startswith('1') or address.startswith('3') or address.startswith('bc1'))):
         return False
     
-    if address not in WALLETS:
-        WALLETS.add(address)
-        save_wallets()
-        
-        # Process historical transactions (only for newly added wallets)
-        try:
-            # Use threading to avoid blocking the main thread
-            threading.Thread(target=process_new_wallet, args=(address,), daemon=True).start()
-        except Exception as e:
-            logger.error(f"Error processing wallet history: {e}")
-        
-        return True
+    with WALLETS_LOCK:
+        if address not in WALLETS:
+            WALLETS.add(address)
+            save_wallets()
+            
+            # Process historical transactions (only for newly added wallets)
+            try:
+                # Use threading to avoid blocking the main thread
+                threading.Thread(target=process_new_wallet, args=(address,), daemon=True).start()
+            except Exception as e:
+                logger.error(f"Error processing wallet history: {e}")
+            
+            return True
     return True  # Return true even if wallet was already tracked
 
 def remove_wallet(address):
     """Remove a wallet from tracking."""
-    if address in WALLETS:
-        WALLETS.remove(address)
-        save_wallets()
-        return True
+    with WALLETS_LOCK:
+        if address in WALLETS:
+            WALLETS.remove(address)
+            save_wallets()
+            return True
     return False
 
 async def get_balance(address, api="blockstream"):
@@ -437,7 +444,8 @@ def process_new_wallet(address, depth=0, max_depth=2):
             for out_addr in output_addresses:
                 if out_addr not in WALLETS and should_track_address(out_addr, input_addresses, outputs):
                     logger.info(f"Auto-tracking new address {out_addr} linked to {address}")
-                    WALLETS.add(out_addr)
+                    with WALLETS_LOCK:
+                        WALLETS.add(out_addr)
                     save_wallets()
                     
                     # Process this new wallet recursively, but increase depth
@@ -479,7 +487,8 @@ async def cleanup_inactive_wallets():
     
     # Remove inactive wallets
     for wallet in wallets_to_remove:
-        WALLETS.remove(wallet)
+        with WALLETS_LOCK:
+            WALLETS.remove(wallet)
         logger.info(f"Removed inactive wallet: {wallet}")
     
     if wallets_to_remove:
@@ -503,6 +512,7 @@ async def get_latest_block_height():
 async def track_wallets():
     """Main function to track transactions on monitored wallets."""
     cleanup_counter = 0  # Counter to trigger cleanup periodically
+    last_check_time = int(time.time())  # Track the last check time
     
     while True:
         current_time = int(time.time())
@@ -516,7 +526,11 @@ async def track_wallets():
             await cleanup_inactive_wallets()
             cleanup_counter = 0
         
-        for wallet in WALLETS:
+        # Create a copy of wallets to iterate over
+        with WALLETS_LOCK:
+            wallets_to_check = list(WALLETS)
+        
+        for wallet in wallets_to_check:
             try:
                 transactions = await get_transactions(wallet)
                 
@@ -532,8 +546,12 @@ async def track_wallets():
                     if not tx_details:
                         continue
                     
-                    # Check if transaction is recent (within last 10 minutes)
+                    # Get transaction timestamp
                     tx_time = tx_details.get("time", tx_details.get("confirmed", tx_details.get("received_time", 0)))
+                    
+                    # Skip if transaction is older than our last check
+                    if tx_time and tx_time < last_check_time:
+                        continue
                     
                     # If we can't get a timestamp, use a block height check as fallback
                     if not tx_time and "block_height" in tx_details:
@@ -541,7 +559,9 @@ async def track_wallets():
                         latest_block = await get_latest_block_height()
                         if latest_block - tx_details["block_height"] > 1:
                             continue
-                    elif tx_time and (current_time - tx_time) > 600:  # Older than 10 minutes
+                    
+                    # Skip if transaction is too old (more than 5 minutes)
+                    if tx_time and (current_time - tx_time) > 300:  # 5 minutes
                         continue
 
                     # Get transaction details and extract important information
@@ -641,7 +661,8 @@ async def track_wallets():
                     for out_addr in output_addresses:
                         if out_addr not in WALLETS and should_track_address(out_addr, input_addresses, outputs):
                             logger.info(f"Auto-tracking new address {out_addr}")
-                            WALLETS.add(out_addr)
+                            with WALLETS_LOCK:
+                                WALLETS.add(out_addr)
                             save_wallets()
                             
                             # Process historical transactions for new wallet in a separate thread
@@ -655,6 +676,9 @@ async def track_wallets():
                 
         # Save status after each full cycle
         save_transaction_history(tx_history)
+        
+        # Update last check time
+        last_check_time = current_time
                 
         # Check again after delay
         await asyncio.sleep(120)  # Check every 2 minutes
@@ -814,10 +838,11 @@ def hackscan_command(message):
             
             if hack_addresses:
                 added_count = 0
-                for address in hack_addresses:
-                    if address not in WALLETS:
-                        WALLETS.add(address)
-                        added_count += 1
+                with WALLETS_LOCK:
+                    for address in hack_addresses:
+                        if address not in WALLETS:
+                            WALLETS.add(address)
+                            added_count += 1
                 
                 # Save the updated wallet list
                 save_wallets()
@@ -857,9 +882,6 @@ async def main():
     logger.info("Starting Bitcoin Tracker Bot")
     print("Starting Bitcoin Tracker Bot")
     
-    # Declare WALLETS as global first
-    global WALLETS
-    
     # Check initial wallet balances
     if WALLETS:
         active_wallets = set()
@@ -867,7 +889,7 @@ async def main():
         
         for wallet in WALLETS:
             try:
-                balance = await get_balance(wallet)  # Note: using await instead of loop.run_until_complete
+                balance = await get_balance(wallet)
                 if balance and balance > 0:
                     active_wallets.add(wallet)
                     logger.info(f"Wallet {wallet} has balance: {balance:.8f} BTC - will be tracked")
@@ -876,8 +898,8 @@ async def main():
             except Exception as e:
                 logger.error(f"Error checking balance for {wallet}: {e}")
         
-        
-        WALLETS = active_wallets
+        with WALLETS_LOCK:
+            WALLETS = active_wallets
         save_wallets()
         logger.info(f"Filtered down to {len(WALLETS)} wallets with non-zero balances")
     
@@ -901,10 +923,11 @@ async def main():
     try:
         hack_addresses = await fetch_addresses_from_hackscan()
         if hack_addresses:
-            for address in hack_addresses:
-                if address not in WALLETS:
-                    WALLETS.add(address)
-                    logger.info(f"Added HackScan address to tracking: {address}")
+            with WALLETS_LOCK:
+                for address in hack_addresses:
+                    if address not in WALLETS:
+                        WALLETS.add(address)
+                        logger.info(f"Added HackScan address to tracking: {address}")
             
             # Save the updated wallet list
             save_wallets()
