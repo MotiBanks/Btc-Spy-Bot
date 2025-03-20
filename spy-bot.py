@@ -20,6 +20,8 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BLOCKCYPHER_API_KEY = os.getenv("BLOCKCYPHER_API_KEY")  # Optional but recommended
+ELLIPTIC_API_ENDPOINT = os.getenv("ELLIPTIC_API_ENDPOINT")  
+
 
 # Validate required variables
 if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
@@ -262,18 +264,91 @@ async def fetch_addresses_from_hackscan():
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://hackscan.hackbounty.io/public/hack-address.json", ssl=ssl_context) as response:
-                data = await response.json()
-                
-                if "btc" not in data:
-                    logger.error("No BTC addresses found in API response")
+                # Check if the request was successful
+                if response.status != 200:
+                    logger.error(f"HackScan API returned status code {response.status}")
                     return []
                 
-                addresses = data["btc"]
-                logger.info(f"Found {len(addresses)} BTC addresses from HackScan")
+                # Try to parse the JSON response
+                try:
+                    data = await response.json()
+                    # Log the actual response structure
+                    logger.info(f"HackScan API response keys: {list(data.keys())}")
+                    
+                    if "btc" not in data:
+                        logger.error("No 'btc' field found in API response")
+                        # Check if there are BTC addresses in a different format
+                        for key in data.keys():
+                            sample_values = list(data[key])[:5] if isinstance(data[key], list) else []
+                            logger.info(f"Sample values in '{key}': {sample_values}")
+                        return []
+                    
+                    addresses = data["btc"]
+                    logger.info(f"Found {len(addresses)} BTC addresses from HackScan")
+                    
+                    # Filter addresses with balance
+                    addresses_with_balance = []
+                    for address in addresses:
+                        try:
+                            balance = await get_balance(address)
+                            if balance and balance > 0:
+                                addresses_with_balance.append(address)
+                                logger.info(f"Found address with balance: {address} ({balance:.8f} BTC)")
+                                
+                                # Add a slight delay to avoid API rate limiting
+                                await asyncio.sleep(0.5)
+                        except Exception as e:
+                            logger.error(f"Error checking balance for {address}: {e}")
+                    
+                    logger.info(f"Found {len(addresses_with_balance)} addresses with balance")
+                    return addresses_with_balance
+                    
+                except ValueError:
+                    # Log the raw response if JSON parsing fails
+                    raw_response = await response.text()
+                    logger.error(f"Failed to parse JSON response: {raw_response[:200]}...")
+                    return []
+                
+    except Exception as e:
+        logger.error(f"Error fetching addresses from HackScan: {e}")
+        return []
+
+
+async def fetch_addresses_from_elliptic():
+    """Fetch BTC addresses from Elliptic API and filter for those with balances."""
+    logger.info("Fetching BTC addresses from Elliptic...")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://your-elliptic-api-endpoint", ssl=ssl_context) as response:
+                data = await response.json()
+                
+                # Extract BTC addresses (this is a placeholder - adjust based on actual API format)
+                btc_addresses = []
+                
+                # Example pattern for extracting BTC addresses
+                for item in data:
+                    # Look for BTC addresses in various fields
+                    if "addresses" in item:
+                        for addr in item["addresses"]:
+                            if is_valid_btc_address(addr):
+                                btc_addresses.append(addr)
+                    
+                    # If addresses are nested in other fields
+                    if "transactions" in item:
+                        for tx in item["transactions"]:
+                            if "sender" in tx and is_valid_btc_address(tx["sender"]):
+                                btc_addresses.append(tx["sender"])
+                            if "receiver" in tx and is_valid_btc_address(tx["receiver"]):
+                                btc_addresses.append(tx["receiver"])
+                
+                # Remove duplicates
+                btc_addresses = list(set(btc_addresses))
+                logger.info(f"Found {len(btc_addresses)} BTC addresses from Elliptic")
                 
                 # Filter addresses with balance
                 addresses_with_balance = []
-                for address in addresses:
+                for address in btc_addresses:
                     try:
                         balance = await get_balance(address)
                         if balance and balance > 0:
@@ -289,8 +364,20 @@ async def fetch_addresses_from_hackscan():
                 return addresses_with_balance
                 
     except Exception as e:
-        logger.error(f"Error fetching addresses from HackScan: {e}")
+        logger.error(f"Error fetching addresses from Elliptic: {e}")
         return []
+
+# Helper function to validate BTC addresses
+def is_valid_btc_address(address):
+    """Basic validation for Bitcoin addresses."""
+    if not isinstance(address, str):
+        return False
+    
+    # Basic validation patterns
+    return (len(address) >= 26 and len(address) <= 35 and
+           (address.startswith('1') or address.startswith('3') or address.startswith('bc1')))
+
+
 
 def analyze_transaction(tx, from_addresses, to_addresses):
     """Analyze a transaction for suspicious patterns."""
@@ -347,6 +434,63 @@ def analyze_transaction(tx, from_addresses, to_addresses):
         special_actions.append(f"🎯 Round number transaction: exactly {value_btc:.1f} BTC")
         
     return special_actions, risk_level
+
+def enhance_transaction_analysis(tx, from_addresses, to_addresses):
+    """Enhanced analysis for suspicious transaction patterns."""
+    # Keep your existing analyze_transaction function
+    special_actions, risk_level = analyze_transaction(tx, from_addresses, to_addresses)
+    
+    # Additional analysis
+    # Check for peeling chains (small outputs with large change address)
+    outputs = []
+    if "vout" in tx:
+        outputs = [{"value": vout.get("value", 0), "address": vout.get("scriptpubkey_address")} 
+                  for vout in tx["vout"] if "scriptpubkey_address" in vout]
+    elif "outputs" in tx:
+        outputs = []
+        for out in tx.get("outputs", []):
+            if "addresses" in out:
+                for addr in out["addresses"]:
+                    outputs.append({"value": out.get("value", 0), "address": addr})
+    
+    if outputs:
+        # Sort by value
+        outputs.sort(key=lambda x: x["value"])
+        
+        # Check for peeling pattern (one large output, several small ones)
+        if len(outputs) >= 2:
+            largest = outputs[-1]["value"]
+            total = sum(out["value"] for out in outputs)
+            
+            if largest > 0.9 * total and len(outputs) >= 3:
+                special_actions.append("🔄 Potential peeling chain detected (large change address)")
+                if risk_level == "🟢 Low":
+                    risk_level = "🟠 Medium"
+    
+    # Check for taint mixing (inputs from both clean and suspicious addresses)
+    known_bad = set()
+    inputs = []
+    
+    if "vin" in tx:
+        inputs = [vin["prevout"]["scriptpubkey_address"] for vin in tx["vin"] 
+                 if "prevout" in vin and "scriptpubkey_address" in vin["prevout"]]
+    elif "inputs" in tx:
+        for inp in tx["inputs"]:
+            if "addresses" in inp:
+                inputs.extend(inp["addresses"])
+    
+    # Check if inputs contain known bad addresses
+    for addr in inputs:
+        if addr in WALLETS:
+            known_bad.add(addr)
+    
+    if known_bad and len(inputs) > len(known_bad):
+        special_actions.append(f"⚠️ Taint mixing: {len(known_bad)} suspicious inputs mixed with {len(inputs) - len(known_bad)} other inputs")
+        if risk_level != "🔴 High":
+            risk_level = "🔴 High"
+    
+    return special_actions, risk_level
+
 
 def should_track_address(address, inputs=None, outputs=None):
     """Determine if a new address should be automatically tracked."""
@@ -503,6 +647,43 @@ def clean_transaction_history():
     # Save the cleaned history
     save_transaction_history(tx_history)
 
+async def scan_for_known_hack_wallets():
+    """Periodically scan for known hack wallets from multiple sources."""
+    while True:
+        try:
+            # Fetch from HackScan
+            hackscan_addresses = await fetch_addresses_from_hackscan()
+            
+            # Fetch from Elliptic
+            elliptic_addresses = await fetch_addresses_from_elliptic()
+            
+            # Combine all addresses
+            all_addresses = set(hackscan_addresses + elliptic_addresses)
+            
+            # Add new addresses to tracking
+            new_count = 0
+            for address in all_addresses:
+                if address not in WALLETS:
+                    WALLETS.add(address)
+                    new_count += 1
+            
+            if new_count > 0:
+                logger.info(f"Added {new_count} new addresses to tracking")
+                save_wallets()
+                
+                # Notify about new addresses
+                bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"🔍 Found {new_count} new hack-related BTC addresses\n"
+                         f"Total tracked addresses: {len(WALLETS)}",
+                    parse_mode="Markdown"
+                )
+        
+        except Exception as e:
+            logger.error(f"Error in scan_for_known_hack_wallets: {e}")
+        
+        # Run every 6 hours
+        await asyncio.sleep(6 * 60 * 60)
 
 async def get_latest_block_height():
     """Get the latest block height."""
@@ -518,9 +699,136 @@ async def get_latest_block_height():
         except:
             return 0
 
+async def track_transaction_chain(tx_hash, depth=0, max_depth=3):
+    """Track where funds from a transaction are sent recursively."""
+    if depth >= max_depth:
+        return
+    
+    logger.info(f"Tracking transaction chain for {tx_hash} (depth {depth})")
+    
+    try:
+        # Get transaction details
+        tx_details = await get_transaction_details(tx_hash)
+        if not tx_details:
+            return
+        
+        # Extract output addresses and values
+        output_addresses = []
+        outputs = []
+        
+        # Extract from different API formats
+        if "vout" in tx_details:
+            for vout in tx_details["vout"]:
+                if "scriptpubkey_address" in vout:
+                    addr = vout["scriptpubkey_address"]
+                    value = vout.get("value", 0) / 100000000  # Convert to BTC
+                    output_addresses.append(addr)
+                    outputs.append({"address": addr, "value": value})
+        
+        elif "outputs" in tx_details:
+            for out in tx_details.get("outputs", []):
+                if "addresses" in out:
+                    for addr in out["addresses"]:
+                        value = out.get("value", 0) / 100000000  # Convert to BTC
+                        output_addresses.append(addr)
+                        outputs.append({"address": addr, "value": value})
+        
+        # For significant outputs, check if they've been spent
+        for output in outputs:
+            addr = output["address"]
+            value = output["value"]
+            
+            # Only track significant amounts
+            if value > 0.1:  # More than 0.1 BTC
+                # Add to tracked wallets if not already
+                if addr not in WALLETS:
+                    logger.info(f"Adding output address to tracking: {addr} ({value:.8f} BTC)")
+                    WALLETS.add(addr)
+                    save_wallets()
+                
+                # Check if this output has been spent
+                if depth < max_depth - 1:
+                    # Get transactions for this address
+                    addr_txs = await get_transactions(addr)
+                    
+                    # Check recent transactions (spending the received funds)
+                    for addr_tx in addr_txs[:3]:  # Check top 3 recent transactions
+                        addr_tx_hash = addr_tx.get("txid", addr_tx.get("hash", ""))
+                        
+                        # Skip the original transaction
+                        if addr_tx_hash == tx_hash:
+                            continue
+                        
+                        # Get details for this transaction
+                        addr_tx_details = await get_transaction_details(addr_tx_hash)
+                        
+                        # Check if this is a spending transaction
+                        is_spending = False
+                        
+                        # Verify this transaction is spending from our address
+                        if "vin" in addr_tx_details:
+                            for vin in addr_tx_details["vin"]:
+                                if "prevout" in vin and "scriptpubkey_address" in vin["prevout"]:
+                                    if vin["prevout"]["scriptpubkey_address"] == addr:
+                                        is_spending = True
+                                        break
+                        
+                        elif "inputs" in addr_tx_details:
+                            for inp in addr_tx_details["inputs"]:
+                                if "addresses" in inp and addr in inp["addresses"]:
+                                    is_spending = True
+                                    break
+                        
+                        # If this transaction is spending from our address, track it
+                        if is_spending:
+                            logger.info(f"Found spending transaction from {addr}: {addr_tx_hash}")
+                            
+                            # Alert about fund movement
+                            special_actions, risk_level = analyze_transaction(addr_tx_details, [addr], output_addresses)
+                            
+                            # Calculate transaction value
+                            tx_value_btc = 0
+                            if "vout" in addr_tx_details:
+                                tx_value_btc = sum(vout.get("value", 0) for vout in addr_tx_details["vout"]) / 100000000
+                            elif "outputs" in addr_tx_details:
+                                tx_value_btc = sum(out.get("value", 0) for out in addr_tx_details["outputs"]) / 100000000
+                            
+                            # Recursively track the next level
+                            await track_transaction_chain(addr_tx_hash, depth + 1, max_depth)
+                            
+                            # Send alert about fund movement
+                            message = f"🔄 *BTC Fund Movement Alert*\n" \
+                                    f"Risk Level: {risk_level}\n\n" \
+                                    f"💰 Amount: *{tx_value_btc:.8f} BTC*\n" \
+                                    f"📤 From: `{addr}`\n" \
+                                    f"🔗 TX: `{addr_tx_hash}`\n\n" \
+                                    f"*Chain Depth:* Level {depth+1} of tracing\n\n"
+                            
+                            if special_actions:
+                                message += "*Special Notes:*\n" + "\n".join(special_actions) + "\n\n"
+                                
+                            message += f"[View on Blockstream](https://blockstream.info/tx/{addr_tx_hash})"
+                            
+                            # Send alert to Telegram
+                            bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=message,
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True
+                            )
+                            
+                            # Add slight delay to avoid rate limiting
+                            await asyncio.sleep(1)
+    
+    except Exception as e:
+        logger.error(f"Error tracking transaction chain for {tx_hash}: {e}")
+        
+        
 async def track_wallets():
     """Main function to track transactions on monitored wallets."""
     cleanup_counter = 0  # Counter to trigger cleanup periodically
+    
+    asyncio.create_task(scan_for_known_hack_wallets())
     
     while True:
         current_time = int(time.time())
@@ -674,7 +982,7 @@ async def track_wallets():
                     
                     # Prevent rate limiting
                     await asyncio.sleep(1)
-            
+                    await track_transaction_chain(tx_hash)
             except Exception as e:
                 logger.error(f"Error processing wallet {wallet}: {e}")
                 
@@ -700,6 +1008,7 @@ def send_welcome(message):
                 "/list - List all tracked addresses\n"
                 "/balance <address> - Get current balance\n"
                 "/hackscan - Fetch known hack addresses from HackScan\n"
+                "/elliptic - Fetch known hack addresses from Elliptic\n" 
                 "/help - Show this help message\n\n"
                 "This bot will automatically alert you about transactions on tracked addresses.",
                 parse_mode="Markdown")
@@ -872,6 +1181,59 @@ def hackscan_command(message):
     # Run in a separate thread
     threading.Thread(target=run_hackscan, daemon=True).start()
 
+@bot.message_handler(commands=['elliptic'])
+def elliptic_command(message):
+    """Handle /elliptic command to update addresses from Elliptic."""
+    if str(message.chat.id) != TELEGRAM_CHAT_ID:
+        bot.reply_to(message, "Unauthorized access.")
+        return
+    
+    bot.reply_to(message, "🔍 Fetching addresses from Elliptic... This may take a few minutes.")
+    
+    # Run in a new event loop within a thread
+    def run_elliptic():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            elliptic_addresses = loop.run_until_complete(fetch_addresses_from_elliptic())
+            
+            if elliptic_addresses:
+                added_count = 0
+                for address in elliptic_addresses:
+                    if address not in WALLETS:
+                        WALLETS.add(address)
+                        added_count += 1
+                
+                # Save the updated wallet list
+                save_wallets()
+                
+                bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"✅ Added {added_count} new addresses from Elliptic with non-zero balances.\n"
+                         f"Total tracked addresses: {len(WALLETS)}",
+                    parse_mode="Markdown"
+                )
+            else:
+                bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text="❌ No addresses with balance found from Elliptic.",
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.error(f"Error in Elliptic command: {e}")
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"Error fetching Elliptic addresses: {str(e)}",
+                parse_mode="Markdown"
+            )
+        finally:
+            loop.close()
+    
+    # Run in a separate thread
+    threading.Thread(target=run_elliptic, daemon=True).start()
+    
+    
 def start_bot_polling():
     """Start Telegram bot polling in a separate thread."""
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
@@ -901,7 +1263,6 @@ async def main():
             except Exception as e:
                 logger.error(f"Error checking balance for {wallet}: {e}")
         
-        # Now you can modify WALLETS
         WALLETS = active_wallets
         save_wallets()
         logger.info(f"Filtered down to {len(WALLETS)} wallets with non-zero balances")
@@ -921,6 +1282,29 @@ async def main():
         )
     except Exception as e:
         logger.error(f"Failed to send startup message: {e}")
+    
+    # Fetch and add addresses from Elliptic
+    try:
+        elliptic_addresses = await fetch_addresses_from_elliptic()
+        if elliptic_addresses:
+            for address in elliptic_addresses:
+                if address not in WALLETS:
+                    WALLETS.add(address)
+                    logger.info(f"Added Elliptic address to tracking: {address}")
+            
+            save_wallets()
+            
+            try:
+                bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"🔍 *Added {len(elliptic_addresses)} BTC addresses from Elliptic*\n\n"
+                        f"These addresses are associated with known hacks and have non-zero balances.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send Elliptic update message: {e}")
+    except Exception as e:
+        logger.error(f"Error processing Elliptic addresses: {e}")
         
     # Fetch and add addresses from HackScan
     try:
