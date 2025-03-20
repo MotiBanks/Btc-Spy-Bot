@@ -488,6 +488,22 @@ async def cleanup_inactive_wallets():
         save_wallets()
         logger.info(f"Removed {len(wallets_to_remove)} inactive wallets")
 
+
+def clean_transaction_history():
+    """Remove transactions older than 30 days from history."""
+    current_time = int(time.time())
+    cutoff_time = current_time - (30 * 24 * 60 * 60)  # 30 days ago
+    
+    # Filter out old transactions
+    tx_history["transactions"] = [
+        tx for tx in tx_history["transactions"] 
+        if tx.get("timestamp", 0) > cutoff_time
+    ]
+    
+    # Save the cleaned history
+    save_transaction_history(tx_history)
+
+
 async def get_latest_block_height():
     """Get the latest block height."""
     try:
@@ -516,9 +532,10 @@ async def track_wallets():
         if cleanup_counter >= 720:  # 24 hours * 60 minutes / 2 minutes per cycle
             logger.info("Running cleanup of inactive wallets...")
             await cleanup_inactive_wallets()
+            clean_transaction_history() 
             cleanup_counter = 0
         
-        for wallet in WALLETS:
+        for wallet in list(WALLETS): 
             try:
                 transactions = await get_transactions(wallet)
                 
@@ -537,14 +554,20 @@ async def track_wallets():
                     # Check if transaction is recent (within last 10 minutes)
                     tx_time = tx_details.get("time", tx_details.get("confirmed", tx_details.get("received_time", 0)))
                     
-                    # If we can't get a timestamp, use a block height check as fallback
-                    if not tx_time and "block_height" in tx_details:
-                        # Skip if not in the latest block
+                    # First check if we have a timestamp
+                    if tx_time:
+                        # If transaction is older than 10 minutes, skip it
+                        if (current_time - tx_time) > 600:
+                            continue
+                    # Fallback to block height if no timestamp
+                    elif "block_height" in tx_details:
                         latest_block = await get_latest_block_height()
+                        # Only process if in the latest few blocks
                         if latest_block - tx_details["block_height"] > 1:
                             continue
-                    elif tx_time and (current_time - tx_time) > 600:  # Older than 10 minutes
-                        continue
+                    # If we can't determine recency, be conservative and skip
+                    else:
+                        continue   
 
                     # Get transaction details and extract important information
                     tx_details = await get_transaction_details(tx_hash)
